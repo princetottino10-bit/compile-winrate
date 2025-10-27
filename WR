@@ -1,0 +1,330 @@
+import React, { useMemo, useState } from "react";
+
+// Single-file React app. Paste match data. Get win-rates for singles/pairs/trios and per-protocol first/second.
+// Output formatted for Discord: bold headers + ```md blocks.
+
+const JP_TO_EN: Record<string, string> = {
+  "ダークネス": "DARKNESS",
+  "サイキック": "PSYCHIC",
+  "グラビティ": "GRAVITY",
+  "ウォーター": "WATER",
+  "ヘイト": "HATE",
+  "メタル": "METAL",
+  "ライト": "LIGHT",
+  "アパシー": "APATHY",
+  "ラブ": "LOVE",
+  "ファイア": "FIRE",
+  "ライフ": "LIFE",
+  "デス": "DEATH",
+  "スピード": "SPEED",
+  "スピリット": "SPIRIT",
+  "プレイグ": "PLAGUE",
+  // Main2 / Aux2 など将来拡張枠（未使用でもOK）
+  "カオス": "CHAOS",
+  "コラプション": "CORRUPTION",
+  "カレッジ": "COURAGE",
+  "アイス": "ICE",
+  "ラック": "LUCK",
+  "ミラー": "MIRROR",
+  "ピース": "PEACE",
+  "スモーク": "SMOKE",
+  "タイム": "TIME",
+  "ダイバーシティ": "DIVERSITY",
+  "アシミレーション": "ASSIMILATION",
+  "ユニティ": "UNITY",
+};
+
+const normalizeToken = (raw: string): string => {
+  let s = raw
+    .replace(/[\uFF5E\u301C]/g, "~")
+    .replace(/[\u2010-\u2015\u2212\-\u30FC\u2014]/g, "-") // hyphen, 長音等
+    .replace(/[\u3000\s]+/g, "");
+  // Map JP to EN
+  for (const [jp, en] of Object.entries(JP_TO_EN)) {
+    if (s.includes(jp)) s = s.replace(new RegExp(jp, "g"), en);
+  }
+  return s.toUpperCase();
+};
+
+type Side = {
+  trio: string[]; // length 3
+  first: boolean; // left side is first
+  win: boolean;
+};
+
+type Match = { left: Side; right: Side };
+
+const splitTeam = (teamRaw: string): string[] => {
+  // Team like: "グラビティウォーターヘイト" or "METALライトアパシー"
+  const tok = normalizeToken(teamRaw);
+  // If already separated by spaces or commas
+  let parts = tok
+    .replace(/[,_]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(" ")
+    .filter(Boolean);
+  if (parts.length >= 3) return parts.slice(0, 3);
+  // If concatenated JP tokens converted to EN, try to cut by known protocol names greedily
+  const ALL = Array.from(new Set(Object.values(JP_TO_EN))).sort((a, b) => b.length - a.length);
+  let s = tok;
+  const out: string[] = [];
+  while (s && out.length < 3) {
+    const hit = ALL.find(p => s.startsWith(p));
+    if (hit) {
+      out.push(hit);
+      s = s.slice(hit.length);
+    } else {
+      // fallback: stop
+      break;
+    }
+  }
+  return out.length ? out : parts;
+};
+
+const parseLine = (lineRaw: string): Match | null => {
+  if (!lineRaw.trim()) return null;
+  // Accept delimiters: -, ―, ー, －, —
+  const delim = /[-\u2010-\u2015\u2212\u30FC]/;
+  const dot = /[◯○〇]/; // winner mark
+  let line = lineRaw.replace(/\s+/g, "");
+  // Winner mark may appear before left or right team
+  const leftWins = dot.test(line.slice(0, 3));
+  if (leftWins) line = line.replace(dot, "");
+  // If right marked, detect by last occurrence
+  let rightWins = false;
+  if (!leftWins) {
+    const idx = line.lastIndexOf("◯");
+    const idx2 = idx === -1 ? line.lastIndexOf("○") : idx;
+    const idx3 = idx2 === -1 ? line.lastIndexOf("〇") : idx2;
+    if (idx3 !== -1) {
+      rightWins = true;
+      line = line.replace(/[◯○〇]/g, "");
+    }
+  }
+  const parts = line.split(delim);
+  if (parts.length !== 2) return null;
+  const [lRaw, rRaw] = parts;
+  const L = splitTeam(lRaw);
+  const R = splitTeam(rRaw);
+  if (L.length !== 3 || R.length !== 3) return null;
+  return {
+    left: { trio: L, first: true, win: leftWins && !rightWins },
+    right: { trio: R, first: false, win: rightWins },
+  };
+};
+
+function combos<T>(arr: T[], k: number): T[][] {
+  const res: T[][] = [];
+  const n = arr.length;
+  const rec = (start: number, path: T[]) => {
+    if (path.length === k) {
+      res.push([...path]);
+      return;
+    }
+    for (let i = start; i < n; i++) rec(i + 1, [...path, arr[i]]);
+  };
+  rec(0, []);
+  return res;
+}
+
+const keyOf = (xs: string[]) => xs.slice().sort().join(" · ");
+
+type Stat = { games: number; wins: number };
+
+const percent = (wins: number, games: number) => (games ? Math.round((wins / games) * 1000) / 10 : 0);
+
+const toRows = (m: Record<string, Stat>) =>
+  Object.entries(m)
+    .map(([k, v]) => ({ name: k, ...v, wr: percent(v.wins, v.games) }))
+    .sort((a, b) => b.wr - a.wr || b.games - a.games || a.name.localeCompare(b.name));
+
+const useStats = (text: string) => {
+  return useMemo(() => {
+    const lines = text
+      .split(/\r?\n/)
+      .map(s => s.trim())
+      .filter(Boolean);
+
+    const matches: Match[] = [];
+    for (const ln of lines) {
+      const m = parseLine(ln);
+      if (m) matches.push(m);
+    }
+
+    const single: Record<string, Stat> = {};
+    const pair: Record<string, Stat> = {};
+    const trio: Record<string, Stat> = {};
+    const first: Record<string, Stat> = {};
+    const second: Record<string, Stat> = {};
+
+    const bump = (map: Record<string, Stat>, key: string, win: boolean) => {
+      if (!map[key]) map[key] = { games: 0, wins: 0 };
+      map[key].games += 1;
+      map[key].wins += win ? 1 : 0;
+    };
+
+    for (const m of matches) {
+      for (const side of [m.left, m.right]) {
+        // singles
+        for (const p of side.trio) bump(single, p, side.win);
+        // pairs
+        for (const c of combos(side.trio, 2)) bump(pair, keyOf(c), side.win);
+        // trio
+        bump(trio, keyOf(side.trio), side.win);
+        // first/second by protocol
+        for (const p of side.trio) bump(side.first ? first : second, p, side.win);
+      }
+    }
+
+    const out = {
+      matches,
+      singleRows: toRows(single),
+      pairRows: toRows(pair),
+      trioRows: toRows(trio),
+      firstRows: toRows(first),
+      secondRows: toRows(second),
+    };
+    return out;
+  }, [text]);
+};
+
+const ClipboardBtn: React.FC<{ text: string; label?: string }> = ({ text, label = "Copy" }) => (
+  <button
+    className="px-3 py-2 rounded-xl border border-zinc-600 shadow text-sm hover:bg-zinc-800"
+    onClick={() => navigator.clipboard.writeText(text)}
+  >
+    {label}
+  </button>
+);
+
+const Section: React.FC<{ title: string; children: React.ReactNode; actions?: React.ReactNode }> = ({ title, children, actions }) => (
+  <section className="bg-zinc-900 rounded-2xl p-4 shadow mb-4">
+    <div className="flex items-center justify-between mb-2">
+      <h2 className="text-lg font-semibold">{title}</h2>
+      {actions}
+    </div>
+    {children}
+  </section>
+);
+
+const mdTable = (rows: { name: string; games: number; wins: number; wr: number }[], label: string) => {
+  const lines = [
+    `**${label}**`,
+    "```md",
+    "| Rank | Name | W | G | WR% |",
+    "|---:|:---|---:|---:|---:|",
+    ...rows.map((r, i) => `| ${i + 1} | ${r.name} | ${r.wins} | ${r.games} | ${r.wr.toFixed(1)} |`),
+    "```",
+  ];
+  return lines.join("\n");
+};
+
+export default function App() {
+  const [input, setInput] = useState<string>(
+    [
+      "◯グラビティウォーターヘイト-メタルライトアパシー",
+      "ラブメタルファイア-◯サイキックダークネスヘイト",
+      "◯ファイアグラビティヘイト-ライフウォーターアパシー",
+      "ファイアグラビティヘイト-◯ダークネスサイキックウォーター",
+    ].join("\n")
+  );
+  const { singleRows, pairRows, trioRows, firstRows, secondRows, matches } = useStats(input);
+
+  const blockSingles = mdTable(singleRows, "Singles (Protocol)");
+  const blockPairs = mdTable(pairRows, "Pairs");
+  const blockTrios = mdTable(trioRows, "Trios");
+  const blockFirst = mdTable(firstRows, "First Player by Protocol");
+  const blockSecond = mdTable(secondRows, "Second Player by Protocol");
+
+  const bundle = [blockSingles, blockPairs, blockTrios, blockFirst, blockSecond].join("\n\n");
+
+  return (
+    <div className="min-h-screen bg-zinc-950 text-zinc-100 p-4 md:p-8">
+      <div className="max-w-5xl mx-auto grid gap-4">
+        <h1 className="text-2xl font-bold">Compile 勝率集計ツール</h1>
+        <Section title="試合データ入力（左=先攻 / 右=後攻 / 勝者に◯）">
+          <textarea
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            className="w-full h-48 md:h-64 p-3 rounded-xl bg-zinc-950 border border-zinc-700 font-mono text-sm"
+            placeholder={"例: \n◯グラビティウォーターヘイト-メタルライトアパシー"}
+          />
+          <p className="text-xs text-zinc-400 mt-2">区切り記号は「- / ― / ー / －」に対応。日本語・英語どちらでもOK。プロトコルは自動で英語大文字に正規化。</p>
+        </Section>
+
+        <Section title={`解析（マッチ数: ${matches.length}）`}>
+          <div className="grid md:grid-cols-2 gap-4">
+            <div>
+              <h3 className="font-semibold mb-1">Singles</h3>
+              <Table rows={singleRows} />
+            </div>
+            <div>
+              <h3 className="font-semibold mb-1">Pairs</h3>
+              <Table rows={pairRows} />
+            </div>
+            <div>
+              <h3 className="font-semibold mb-1">Trios</h3>
+              <Table rows={trioRows} />
+            </div>
+            <div>
+              <h3 className="font-semibold mb-1">First / Second by Protocol</h3>
+              <div className="grid grid-cols-1 gap-2">
+                <div>
+                  <h4 className="text-sm text-zinc-400">First</h4>
+                  <Table rows={firstRows} compact />
+                </div>
+                <div>
+                  <h4 className="text-sm text-zinc-400">Second</h4>
+                  <Table rows={secondRows} compact />
+                </div>
+              </div>
+            </div>
+          </div>
+        </Section>
+
+        <Section title="Discord出力">
+          <pre className="whitespace-pre-wrap text-sm border border-zinc-700 rounded-xl p-3 bg-black/60">{bundle}</pre>
+          <div className="mt-2"><ClipboardBtn text={bundle} label="コピー" /></div>
+        </Section>
+      </div>
+    </div>
+  );
+}
+
+const Table: React.FC<{ rows: { name: string; games: number; wins: number; wr: number }[]; compact?: boolean }> = ({ rows, compact }) => {
+  return (
+    <div className="overflow-x-auto border border-zinc-700 rounded-xl">
+      <table className={`min-w-full text-sm ${compact ? "" : ""}`}>
+        <thead>
+          <tr className="bg-zinc-900">
+            <Th className="w-12 text-right">#</Th>
+            <Th>Name</Th>
+            <Th className="text-right">W</Th>
+            <Th className="text-right">G</Th>
+            <Th className="text-right">WR%</Th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r, i) => (
+            <tr key={r.name} className="border-t border-zinc-800">
+              <Td className="text-right pr-2">{i + 1}</Td>
+              <Td>{r.name}</Td>
+              <Td className="text-right">{r.wins}</Td>
+              <Td className="text-right">{r.games}</Td>
+              <Td className="text-right">{r.wr.toFixed(1)}</Td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+};
+
+const Th: React.FC<{ children: React.ReactNode; className?: string }> = ({ children, className = "" }) => (
+  <th className={`px-3 py-2 font-medium text-zinc-200 ${className}`}>{children}</th>
+);
+const Td: React.FC<{ children: React.ReactNode; className?: string }> = ({ children, className = "" }) => (
+  <td className={`px-3 py-2 ${className}`}>{children}</td>
+);
+
